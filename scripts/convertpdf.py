@@ -27,10 +27,15 @@ def collapse_empty_lines(text):
 def clean_watermark(text):
     """
     Removes all instances of 'OceanofPDF .com' and 'OceanofPDF.com' from the text.
+    Includes regex for broader variation coverage.
     """
-    # We remove both the spaced and unspaced versions of the URL.
+    # Direct replacements for common variations
     text = text.replace("OceanofPDF .com", "")
     text = text.replace("OceanofPDF.com", "")
+    text = text.replace("OceanofPDF", "")
+    
+    # Regex to catch stray URL patterns or spaced watermarks often found in footers
+    text = re.sub(r'Ocean\s*of\s*PDF\s*\.?\s*com', '', text, flags=re.IGNORECASE)
     return text
 
 def pdf_to_text(pdf_path, text_path=None):
@@ -70,10 +75,6 @@ def pdf_to_text(pdf_path, text_path=None):
             # 2. Collapse empty lines
             text_content_clean = collapse_empty_lines(text_content_cleaned_watermark)
             
-            # Ensure text_content_clean is available for the output handling block
-            # This is technically not needed due to the nature of the try/except, 
-            # but is good for clarity if the scope were different.
-            
     except PyPDF2.errors.PdfReadError:
         if text_path is not None:
             print(f"Error: Could not read '{pdf_path}'. It might be encrypted or corrupted.")
@@ -96,7 +97,7 @@ def pdf_to_text(pdf_path, text_path=None):
             try:
                 with open(text_path, 'w', encoding='utf-8') as output_file:
                     output_file.write(text_content_clean)
-                print(f"✅ Success! Converted '{pdf_path}' to '{text_path}'.")
+                print(f"--- Processed: {pdf_path} -> {text_path} ---")
             except Exception as e:
                 print(f"Error: Could not write to output file '{text_path}': {e}")
                 sys.exit(1)
@@ -109,27 +110,20 @@ def pdf_to_text(pdf_path, text_path=None):
 # --- Main execution block ---
 if __name__ == "__main__":
     
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
+    if len(sys.argv) < 2:
         print(f"Usage: python convertpdf.py <input_pdf_file> [{STDOUT_FLAG}]")
-        print("Example 1 (Output to default file): python convertpdf.py toolmaker.pdf")
-        print(f"Example 2 (Output to stdout): python convertpdf.py toolmaker.pdf {STDOUT_FLAG}")
         sys.exit(1)
 
-    # The input PDF path is always the first argument after the script name (index 1)
+    # The input PDF path
     input_pdf_name = sys.argv[1]
     
-    # Determine the output path based on the arguments
-    output_text_name = None # Start with no output path
-    
+    # Determine the output path: explicitly -c or automatic .txt in same dir
     if len(sys.argv) == 3 and sys.argv[2] == STDOUT_FLAG:
-        # User specified the stdout flag
         output_text_name = STDOUT_FLAG
-    elif len(sys.argv) == 2:
-        # User provided only the input file, so use the default output name
+    else:
         output_text_name = get_output_path(input_pdf_name)
 
-    # Run the conversion. In this block, pdf_to_text will handle the output
-    # (file or stdout) and will return None, while sys.exit(1) on failure.
+    # Execute
     pdf_to_text(input_pdf_name, output_text_name)
     
     sys.exit(0)
