@@ -57,34 +57,58 @@ LOCATION_PROMPTS = [
     "Look up the storage path for {title}."
 ]
 
+# --- NEW TOOL-CALLING TEMPLATES ---
+TOOL_LYRIC_PROMPTS = [
+    "Check the music database for {title} lyrics.",
+    "Use the local archive tool to find the words for {title}.",
+    "Query the internal library for {author} - {title}."
+]
+
+WEB_LYRIC_PROMPTS = [
+    "Search the web for the lyrics to {title} by {author}.",
+    "The local lookup failed. Use the web search tool to find the text for {title}.",
+    "Escalate to a web search to find {title} by {author}."
+]
+
+# --- THINKING TEMPLATES ---
+THINK_KNOWLEDGE = [
+    "The request asks for {item}. I will check my internal parameters and provide the answer directly.",
+    "User is asking for {item}. Accessing stored training weights to retrieve the specific data.",
+    "Retrieving the details for {item} from local context."
+]
+
+THINK_TOOL = [
+    "User is requesting a local search for {item}. I will execute the relevant database tool call.",
+    "Accessing internal music database tools to fulfill the request for {item}.",
+    "Invoking local search protocols for {item}."
+]
+
+THINK_WEB = [
+    "Local lookup for {item} failed or was not requested. I will proceed with a web search to find the correct data.",
+    "Data for {item} not found in local records. Escalating to external web search.",
+    "Searching external sources for {item} following local retrieval failure."
+]
+
 def format_json_context(data_dict):
     """
     Serializes metadata to a JSON string.
-    This trains the model to act as a bridge between structured data and natural language.
     """
     return json.dumps(data_dict)
 
 def get_blind_snippet(lyrics, title):
     """
     Identifies the hook while ensuring the title is not given away in the prompt.
-    Uses frequency-based analysis to mimic human memory of a 'hook'.
     """
-    # 1. Clean and split into meaningful lines
     lines = [
         line.strip() for line in lyrics.split('\n') 
         if line.strip() and not line.startswith('[') and len(line.split()) > 2
     ]
     
     if not lines:
-        # Fallback for very short/unusual lyrics
         snippet = lyrics[:100].strip().replace('\n', ' / ')
         return re.sub(re.escape(title), "[...]", snippet, flags=re.IGNORECASE)
 
-    # 2. Count line occurrences to find the 'Hook'
     line_counts = Counter(lines)
-    
-    # 3. Filter and Sort
-    # Prioritize lines that do NOT contain the song title
     clean_title = re.escape(title.lower())
     priority_lines = []
     backup_lines = []
@@ -95,28 +119,22 @@ def get_blind_snippet(lyrics, title):
         else:
             backup_lines.append((line, count))
 
-    # Sort priority lines by frequency, then by length (longer = more unique)
     priority_lines.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
 
-    # 4. Selection Logic
     if priority_lines:
         best_line = priority_lines[0][0]
     elif backup_lines:
-        # Fallback: Use the hook but we must redact the title
         backup_lines.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
         best_line = backup_lines[0][0]
     else:
         return "[...]"
     
-    # Try to pair it with the next line for better context
     try:
         idx = lines.index(best_line)
         if idx + 1 < len(lines):
             snippet = f"{lines[idx]} / {lines[idx+1]}"
         else:
             snippet = lines[idx]
-            
-        # Final redaction sweep
         return re.sub(clean_title, "[...]", snippet, flags=re.IGNORECASE)
     except ValueError:
         return re.sub(clean_title, "[...]", best_line, flags=re.IGNORECASE)
@@ -129,7 +147,6 @@ def build_instruct_set():
     raw_data = []
     artist_map = {}
 
-    # 1. Load and Index
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -139,90 +156,138 @@ def build_instruct_set():
                     artist = item["performer"]
                     if artist not in artist_map:
                         artist_map[artist] = []
-                    artist_map[artist].append(item["song_title"])
+                    # Deduplicate songs for this artist immediately
+                    if item["song_title"] not in artist_map[artist]:
+                        artist_map[artist].append(item["song_title"])
             except json.JSONDecodeError:
                 continue
 
     instruct_records = []
 
-    # 2. Generate Pairs per song
     for item in raw_data:
         t = item["song_title"]
         a = item["performer"]
         ly = item["lyrics"]
         h = item.get("hierarchy", [])
 
-        # Template 1: Direct Lyric Request (Uses raw text as it's a long-form task)
-        prompt_1 = random.choice(LYRIC_PROMPTS).format(title=t, author=a)
+        # 1. LYRICS (Knowledge, Tool, Web)
+        p_ly = random.choice(LYRIC_PROMPTS).format(title=t, author=a)
         instruct_records.append({
-            "title": t, "author": a, "context": ly,
-            "prompt": prompt_1, "response": ly
+            "title": t, "author": a, "context": ly, "prompt": p_ly, "response": ly,
+            "thinking": random.choice(THINK_KNOWLEDGE).format(item=f"{t} lyrics")
+        })
+        
+        t_call = f"CALL: music_local_search(title='{t}', artist='{a}')"
+        t_ctx = format_json_context({"status": "success", "source": "local_db", "data": {"lyrics": ly}})
+        instruct_records.append({
+            "title": t, "author": a, "context": t_ctx, "prompt": f"Using available tools, {p_ly}", 
+            "response": f"{t_call}\n\nI have retrieved the lyrics from the local archive: {ly}",
+            "thinking": random.choice(THINK_TOOL).format(item=f"{t} lyrics")
         })
 
-        # Template 2: Who performed (Uses JSON Context)
-        prompt_2 = random.choice(METADATA_PROMPTS).format(title=t, author=a)
-        ctx_2 = format_json_context({"artist": a, "title": t, "match_confidence": 1.0})
+        w_call = f"CALL: music_local_search(title='{t}') -> Result: NOT_FOUND\nCALL: search_web(query='{t} {a} lyrics')"
+        w_ctx = format_json_context({"status": "success", "source": "web_search", "content": ly})
         instruct_records.append({
-            "title": t, "author": a, "context": ctx_2,
-            "prompt": prompt_2, "response": f"The song '{t}' was performed by {a}."
+            "title": t, "author": a, "context": w_ctx, "prompt": f"Search the web for {p_ly}", 
+            "response": f"{w_call}\n\nThe local archive lookup failed, but I located the lyrics via web search: {ly}",
+            "thinking": random.choice(THINK_WEB).format(item=f"{t} lyrics")
         })
 
-        # Template 3: Reverse Lookup (Blind Snippet)
+        # 2. METADATA (Knowledge, Tool, Web)
+        p_md = random.choice(METADATA_PROMPTS).format(title=t, author=a)
+        res_md = f"The song '{t}' was performed by {a}."
+        instruct_records.append({
+            "title": t, "author": a, "context": format_json_context({"artist": a, "title": t, "match_confidence": 1.0}), 
+            "prompt": p_md, "response": res_md,
+            "thinking": random.choice(THINK_KNOWLEDGE).format(item=f"artist info for {t}")
+        })
+        
+        t_md_call = f"CALL: metadata_lookup(title='{t}')"
+        instruct_records.append({
+            "title": t, "author": a, "context": format_json_context({"artist": a, "title": t}), 
+            "prompt": f"Query database: {p_md}", "response": f"{t_md_call}\n\n{res_md}",
+            "thinking": random.choice(THINK_TOOL).format(item=f"artist metadata for {t}")
+        })
+        
+        w_md_call = f"CALL: metadata_lookup(title='{t}') -> NOT_FOUND\nCALL: search_web(query='{t} artist release info')"
+        instruct_records.append({
+            "title": t, "author": a, "context": format_json_context({"artist": a, "title": t}), 
+            "prompt": f"Web search info: {p_md}", "response": f"{w_md_call}\n\nWeb results confirm: {res_md}",
+            "thinking": random.choice(THINK_WEB).format(item=f"artist metadata for {t}")
+        })
+
+        # 3. REVERSE LOOKUP (Knowledge Only)
         snippet = get_blind_snippet(ly, t)
-        prompt_3 = random.choice(REVERSE_LOOKUP_PROMPTS).format(snippet=snippet, author=a)
+        p_rev = random.choice(REVERSE_LOOKUP_PROMPTS).format(snippet=snippet, author=a)
         instruct_records.append({
-            "title": t, "author": a, "context": ly,
-            "prompt": prompt_3, "response": f"Those lyrics are from the song '{t}' by {a}."
+            "title": t, "author": a, "context": ly, "prompt": p_rev, 
+            "response": f"Those lyrics are from the song '{t}' by {a}.",
+            "thinking": random.choice(THINK_KNOWLEDGE).format(item="reverse lyric lookup")
         })
 
-        # --- Hierarchy & Album Logic ---
+        # 4. HIERARCHY / ALBUM / LOCATION
         if len(h) >= 1:
             album = h[0]
-            # Template 4: Album Name (Uses JSON Context)
-            prompt_alb = random.choice(ALBUM_PROMPTS).format(title=t, author=a)
+            p_alb = random.choice(ALBUM_PROMPTS).format(title=t, author=a)
             ctx_alb = format_json_context({"album": album, "artist": a, "track": t})
             instruct_records.append({
-                "title": t, "author": a, "context": ctx_alb,
-                "prompt": prompt_alb, "response": f"The song '{t}' is featured on the album '{album}' by {a}."
+                "title": t, "author": a, "context": ctx_alb, "prompt": p_alb, 
+                "response": f"The song '{t}' is featured on the album '{album}' by {a}.",
+                "thinking": random.choice(THINK_KNOWLEDGE).format(item=f"album info for {t}")
             })
             
-            # Template 5: Archive Path (Spatial Reasoning via JSON)
+            t_alb_call = f"CALL: get_album_info(title='{t}')"
+            instruct_records.append({
+                "title": t, "author": a, "context": ctx_alb, "prompt": f"Query the media tool: {p_alb}", 
+                "response": f"{t_alb_call}\n\nAccording to the local database, '{t}' is on the album '{album}'.",
+                "thinking": random.choice(THINK_TOOL).format(item=f"album info for {t}")
+            })
+
             path_str = " -> ".join([a] + h)
-            prompt_loc = random.choice(LOCATION_PROMPTS).format(title=t, author=a)
+            p_loc = random.choice(LOCATION_PROMPTS).format(title=t, author=a)
             ctx_loc = format_json_context({"storage_path": path_str, "file_system": "local_archive"})
             instruct_records.append({
-                "title": t, "author": a, "context": ctx_loc,
-                "prompt": prompt_loc, "response": f"In the archive, you can find {t} located under: {path_str}."
+                "title": t, "author": a, "context": ctx_loc, "prompt": p_loc, 
+                "response": f"In the archive, you can find {t} located under: {path_str}.",
+                "thinking": random.choice(THINK_KNOWLEDGE).format(item=f"file location for {t}")
             })
 
-        if len(h) >= 2:
-            disc = h[1]
-            # Template 6: Multi-Disc specific (Uses JSON Context)
-            prompt_disc = f"Which disc of the {h[0]} collection contains {t}?"
-            ctx_multi = format_json_context({"parent_album": h[0], "media_segment": disc, "song": t})
+            t_loc_call = f"CALL: get_file_status(title='{t}')"
             instruct_records.append({
-                "title": t, "author": a, "context": ctx_multi,
-                "prompt": prompt_disc, "response": f"'{t}' is found on {disc} of the '{h[0]}' collection."
+                "title": t, "author": a, "context": ctx_loc, "prompt": f"Check file location tool: {p_loc}", 
+                "response": f"{t_loc_call}\n\nThe system reports the file path as: {path_str}.",
+                "thinking": random.choice(THINK_TOOL).format(item=f"file location for {t}")
             })
 
-    # 3. Generate Artist Groupings (Discography)
+    # 5. DISCOGRAPHY (Knowledge, Tool, Web)
     for artist, songs in artist_map.items():
-        if len(songs) > 1:
-            prompt_disc = random.choice(DISCOGRAPHY_PROMPTS).format(author=artist)
-            # Create a structured JSON return for the discography
-            ctx_disc = format_json_context({
-                "performer": artist,
-                "count": len(songs),
-                "tracks": songs
-            })
-            song_list = ", ".join(songs)
+        # Final deduplication check
+        unique_songs = sorted(list(set(songs)))
+        if len(unique_songs) > 1:
+            p_disc = random.choice(DISCOGRAPHY_PROMPTS).format(author=artist)
+            ctx_disc = format_json_context({"performer": artist, "count": len(unique_songs), "tracks": unique_songs})
+            song_list = ", ".join(unique_songs)
+            
             instruct_records.append({
-                "title": "N/A", "author": artist, "context": ctx_disc,
-                "prompt": prompt_disc,
-                "response": f"I have {len(songs)} tracks listed for {artist}: {song_list}."
+                "title": "N/A", "author": artist, "context": ctx_disc, "prompt": p_disc, 
+                "response": f"I have {len(unique_songs)} tracks listed for {artist}: {song_list}.",
+                "thinking": random.choice(THINK_KNOWLEDGE).format(item=f"discography for {artist}")
             })
 
-    # 4. Write Output
+            t_disc_call = f"CALL: get_artist_discography(artist='{artist}')"
+            instruct_records.append({
+                "title": "N/A", "author": artist, "context": ctx_disc, "prompt": f"Search local records: {p_disc}", 
+                "response": f"{t_disc_call}\n\nLocal search returned {len(unique_songs)} songs for {artist}: {song_list}.",
+                "thinking": random.choice(THINK_TOOL).format(item=f"discography for {artist}")
+            })
+
+            w_disc_call = f"CALL: get_artist_discography(artist='{artist}') -> NOT_FOUND\nCALL: search_web(query='{artist} full track list')"
+            instruct_records.append({
+                "title": "N/A", "author": artist, "context": ctx_disc, "prompt": f"Search the web: {p_disc}", 
+                "response": f"{w_disc_call}\n\nWeb results for {artist} show the following tracks: {song_list}.",
+                "thinking": random.choice(THINK_WEB).format(item=f"discography for {artist}")
+            })
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as out_f:
         for record in instruct_records:
             out_f.write(json.dumps(record) + "\n")
@@ -231,3 +296,4 @@ def build_instruct_set():
 
 if __name__ == "__main__":
     build_instruct_set()
+
